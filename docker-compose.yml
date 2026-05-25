@@ -1,0 +1,11 @@
+services:
+  envoy:
+    image: envoyproxy/envoy:v1.33-latest
+    ports:
+      - "8000:8000"   # Proxy-Eingang
+      - "9901:9901"   # Admin-Interface
+    volumes:
+      - ./envoy.yaml:/etc/envoy/envoy.yaml:ro
+    extra_hosts:
+      # Damit host.docker.internal auf den Host zeigt (funktioniert auch auf Linux)
+      - "host.docker.internal:host-gateway"
