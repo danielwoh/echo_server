@@ -1,0 +1,114 @@
+static_resources:
+
+  listeners:
+    - name: listener_0
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 8000
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: echo_backend
+                      domains: ["*"]
+                      routes:
+                        - match:
+                            prefix: "/"
+                          route:
+                            cluster: echo_server
+                http_filters:
+                  # ── Lua-Filter ────────────────────────────────────────────
+                  - name: envoy.filters.http.lua
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+                      inline_code: |
+                        function envoy_on_request(request_handle)
+                          -- 1. Check if the path matches the OAuth token endpoint
+                          local path = request_handle:headers():get(":path")
+                          if not path:match("^/REST/v1/OAuth/GetAccessToken") then
+                            return
+                          end
+
+                          -- 2. Read body
+                          local body_size = request_handle:body():length()
+                          local body_bytes = request_handle:body():getBytes(0, body_size)
+
+                          -- 3. Parse x-www-form-urlencoded parameters
+                          local params = {}
+                          for k, v in string.gmatch(body_bytes, "([^&=]+)=([^&=]+)") do
+                            k = string.gsub(k, "%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end)
+                            v = string.gsub(v, "%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end)
+                            params[k] = v
+                          end
+
+                          -- 4. Only handle authorization_code grant type
+                          if params["grant_type"] ~= "authorization_code" then
+                            return
+                          end
+
+                          -- 5. Rewrite path to broker endpoint
+                          request_handle:headers():replace(":path", "/realms/HINCredmapper/protocol/openid-connect/token")
+
+                          -- 6. URL-encode helper
+                          local function urlencode(str)
+                            if str then
+                              str = string.gsub(str, "\n", "\r\n")
+                              str = string.gsub(str, "([^%w %-%_%.%~])", function(c)
+                                return string.format("%%%02X", string.byte(c))
+                              end)
+                              str = string.gsub(str, " ", "+")
+                            end
+                            return str
+                          end
+
+                          -- 7. Reconstruct body with mapped parameter names
+                          local new_body = string.format(
+                            "grant_type=credmapper_authorization_code&code=%s&client_id=credmapper&cm_client_id=%s&cm_client_secret=%s&cm_redirect_uri=%s",
+                            urlencode(params["code"] or ""),
+                            urlencode(params["client_id"] or ""),
+                            urlencode(params["client_secret"] or ""),
+                            urlencode(params["redirect_uri"] or "")
+                          )
+
+                          -- 8. Set new body and update Content-Length
+                          request_handle:body():setBytes(new_body)
+                          request_handle:headers():replace("content-length", tostring(#new_body))
+                        end
+
+                        function envoy_on_response(response_handle)
+                          response_handle:headers():add("x-via-envoy", "true")
+                        end
+                  # ──────────────────────────────────────────────────────────
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    - name: echo_server
+      connect_timeout: 0.25s
+      type: STRICT_DNS
+      dns_lookup_family: V4_ONLY
+      load_assignment:
+        cluster_name: echo_server
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      # host.docker.internal points to the host (macOS Docker Desktop)
+                      # In production, replace with broker.pre.hintest.ch on port 443
+                      address: host.docker.internal
+                      port_value: 8080
+
+# Envoy Admin-Interface
+admin:
+  address:
+    socket_address:
+      address: 0.0.0.0
+      port_value: 9901
